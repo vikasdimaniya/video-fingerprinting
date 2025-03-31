@@ -14,8 +14,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class M4sFrameReader(FrameReader):
-    """M4S reader that reads frames directly from FFmpeg pipe"""
+class SimpleM4sReader(FrameReader):
+    """Streamlined M4S reader that reads frames directly from FFmpeg pipe without saving to disk"""
     
     def __init__(self, m4s_file, init_segment):
         super().__init__()

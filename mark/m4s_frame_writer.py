@@ -35,6 +35,10 @@ class M4sFrameWriter(FrameWriter):
             return
             
         try:
+            # Convert frame if needed
+            if frame.dtype != np.uint8:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            
             self.frame_count += 1
             
             # Save frame as image
@@ -106,7 +110,7 @@ class M4sFrameWriter(FrameWriter):
             
         except Exception as e:
             logger.error(f"Error encoding frames: {str(e)}")
-            if os.path.exists(temp_mp4):
+            if 'temp_mp4' in locals() and os.path.exists(temp_mp4):
                 os.unlink(temp_mp4)
             raise
         finally:
@@ -122,21 +126,31 @@ class M4sFrameWriter(FrameWriter):
             except Exception as e:
                 logger.error(f"Error cleaning up temporary directory: {str(e)}")
             self.frames_dir = None
+            
+    def is_alive(self):
+        """Check if the writer is available for writing"""
+        return not self.closed
+    
+    def get_last_error(self):
+        """Return the last error if any"""
+        return None if not self.closed else "Writer is closed"
 
 
 # Create a debug-enabled version that also saves frames for inspection
 class DebugM4sFrameWriter(M4sFrameWriter):
     """Enhanced M4sFrameWriter that also saves frames for debugging"""
     
-    def __init__(self, output_file, width, height, debug_dir, prefix="frame"):
+    def __init__(self, output_file, width, height, debug_dir=None, prefix="frame", save_debug_frames=True):
         super().__init__(output_file, width, height)
         self.debug_dir = debug_dir
         self.prefix = prefix
         self.debug_count = 0
+        self.save_debug_frames = save_debug_frames
         
-        # Create debug directory
-        os.makedirs(debug_dir, exist_ok=True)
-        logger.info(f"Debug frame writer initialized, saving to {debug_dir}")
+        # Create debug directory if needed
+        if self.save_debug_frames and debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            logger.info(f"Debug frame writer initialized, saving to {debug_dir}")
         
     def write(self, frame):
         """Write frame to the M4S writer and also save for debugging"""
@@ -144,13 +158,18 @@ class DebugM4sFrameWriter(M4sFrameWriter):
         super().write(frame)
         
         # Save debug frame (every 5th frame)
-        self.debug_count += 1
-        if self.debug_count % 5 == 0:
-            debug_path = os.path.join(self.debug_dir, f"{self.prefix}_{self.debug_count:04d}.jpg")
-            cv2.imwrite(debug_path, frame)
-            logger.debug(f"Saved debug frame {self.debug_count} to {debug_path}")
+        if self.save_debug_frames and self.debug_dir:
+            self.debug_count += 1
+            if self.debug_count % 5 == 0:
+                debug_path = os.path.join(self.debug_dir, f"{self.prefix}_{self.debug_count:04d}.png")
+                try:
+                    cv2.imwrite(debug_path, frame)
+                    logger.debug(f"Saved debug frame {self.debug_count} to {debug_path}")
+                except Exception as e:
+                    logger.error(f"Error saving debug frame: {str(e)}")
             
     def close(self):
         """Close the M4sFrameWriter"""
-        super().close()
-        logger.info(f"Debug M4S writer closed after processing {self.debug_count} frames") 
+        if self.save_debug_frames and self.debug_dir:
+            logger.info(f"Debug M4S writer saved {self.debug_count//5} debug frames")
+        super().close() 
