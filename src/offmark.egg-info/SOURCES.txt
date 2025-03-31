@@ -1,0 +1,12 @@
+setup.py
+offmark/__init__.py
+offmark.egg-info/PKG-INFO
+offmark.egg-info/SOURCES.txt
+offmark.egg-info/dependency_links.txt
+offmark.egg-info/requires.txt
+offmark.egg-info/top_level.txt
+offmark/video/__init__.py
+offmark/video/embedder.py
+offmark/video/extractor.py
+offmark/video/frame_reader.py
+offmark/video/frame_writer.py
