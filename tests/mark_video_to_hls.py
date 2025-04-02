@@ -8,12 +8,16 @@ import argparse
 import json
 from pathlib import Path
 import tempfile
+import cv2
+from collections import Counter
 
 from offmark.embed.dwt_dct_svd_encoder import DwtDctSvdEncoder
 from offmark.generator.shuffler import Shuffler
 from offmark.video.embedder import Embedder
 from offmark.video.frame_reader import FileDecoder
 from offmark.video.frame_writer import FileEncoder
+from offmark.degenerator.de_shuffler import DeShuffler
+from offmark.extract.dwt_dct_svd_decoder import DwtDctSvdDecoder
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -182,6 +186,89 @@ def convert_segments_to_hls(segment_files, hls_output_dir):
     
     return master_playlist, playlist
 
+def detect_patterns_in_segment(marked_file, expected_payload=None, segment_number=None):
+    """
+    Detect patterns in each frame of a watermarked segment
+    
+    Args:
+        marked_file: Path to watermarked segment
+        expected_payload: Expected watermark payload
+        segment_number: Segment number to derive expected payload if not provided
+    
+    Returns:
+        tuple: (most_common_pattern, frequency, success)
+    """
+    logger.info(f"Detecting patterns in {marked_file}")
+    
+    # If segment_number is provided but expected_payload isn't, derive it
+    if expected_payload is None and segment_number is not None:
+        expected_payload = generate_payload_for_segment(segment_number)
+    
+    # If neither is provided, try to extract segment number from filename
+    if expected_payload is None and segment_number is None:
+        segment_number = extract_segment_number_from_filename(marked_file)
+        if segment_number is not None:
+            expected_payload = generate_payload_for_segment(segment_number)
+    
+    # If we still don't have an expected payload, we can't verify
+    if expected_payload is None:
+        logger.warning(f"No expected payload for {marked_file}, cannot verify")
+        return None, 0, False
+    
+    r = FileDecoder(marked_file)
+    degenerator = DeShuffler(key=0)
+    
+    # Handle both numpy array and list cases
+    if isinstance(expected_payload, np.ndarray):
+        degenerator.set_shape(expected_payload.shape)
+    else:
+        degenerator.set_shape(np.array(expected_payload).shape)
+        
+    frame_extractor = DwtDctSvdDecoder()
+    
+    # Custom pattern collector
+    patterns = []
+    while True:
+        in_frame = r.read()
+        if in_frame is None:
+            break
+
+        wm_frame_yuv = cv2.cvtColor(in_frame.astype(np.float32), cv2.COLOR_BGR2YUV)
+        frame_yuv = frame_extractor.decode(wm_frame_yuv)
+        pattern = degenerator.degenerate(frame_yuv)
+        if pattern is not None:
+            patterns.append(pattern)
+
+    r.close()
+    
+    # Analyze collected patterns
+    if not patterns:
+        logger.warning(f"No patterns collected in {marked_file}")
+        return None, 0, False
+        
+    # Convert patterns to strings for counting
+    pattern_strings = [''.join(map(str, pattern)) for pattern in patterns]
+    counter = Counter(pattern_strings)
+    
+    # Find most common pattern
+    most_common_pattern_str, count = counter.most_common(1)[0]
+    most_common_pattern = np.array([int(bit) for bit in most_common_pattern_str])
+    
+    # Calculate frequency of most common pattern
+    frequency = count / len(patterns) if patterns else 0
+    
+    # Check if most common pattern matches expected payload
+    if isinstance(expected_payload, np.ndarray):
+        success = np.array_equal(most_common_pattern, expected_payload)
+    else:
+        # If expected_payload is a list (from JSON), convert to numpy array
+        success = np.array_equal(most_common_pattern, np.array(expected_payload))
+    
+    logger.info(f"Segment {segment_number}: most common pattern: {most_common_pattern}, "
+                f"expected: {expected_payload}, frequency: {frequency:.2f}, matches: {success}")
+    
+    return most_common_pattern, frequency, success
+
 def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Watermark a video and convert to HLS')
@@ -226,6 +313,36 @@ def main():
         marked_segments.append(output_file)
         segment_payloads[str(segment_number)] = payload  # Convert keys to strings for JSON
     
+    # Always verify watermarking was successful
+    failed_segments = []
+    logger.info("Verifying watermarks in segments")
+    
+    for marked_segment in marked_segments:
+        segment_number = extract_segment_number_from_filename(marked_segment)
+        expected_payload = segment_payloads.get(str(segment_number))
+        
+        most_common_pattern, frequency, success = detect_patterns_in_segment(
+            marked_segment, expected_payload, segment_number)
+        
+        if not success or frequency < 0.5:  # Consider failed if less than 50% of frames have the expected pattern
+            failed_segments.append({
+                'segment': os.path.basename(marked_segment),
+                'segment_number': segment_number,
+                'expected_pattern': expected_payload,
+                'detected_pattern': most_common_pattern.tolist() if most_common_pattern is not None else None,
+                'frequency': frequency
+            })
+    
+    # Report on failed segments
+    if failed_segments:
+        logger.warning(f"Failed to properly watermark {len(failed_segments)} segments:")
+        for failed in failed_segments:
+            logger.warning(f"  Segment {failed['segment_number']} ({failed['segment']}): "
+                          f"expected {failed['expected_pattern']}, detected {failed['detected_pattern']}, "
+                          f"frequency: {failed['frequency']:.2f}")
+    else:
+        logger.info("All segments were watermarked successfully!")
+    
     # Step 3: Convert marked segments to HLS
     logger.info("Step 3: Converting marked segments to HLS")
     master_playlist, playlist = convert_segments_to_hls(marked_segments, hls_dir)
@@ -235,11 +352,29 @@ def main():
     with open(payload_file, 'w') as f:
         json.dump(segment_payloads, f, indent=2)
     
+    # Save failed segments information if any
+    if failed_segments:
+        failed_file = os.path.join(base_dir, 'failed_segments.json')
+        with open(failed_file, 'w') as f:
+            json.dump(failed_segments, f, indent=2)
+        logger.info(f"Failed segments information saved to: {failed_file}")
+    
     # Final output
     logger.info(f"Watermarking and HLS conversion complete")
     logger.info(f"Master playlist: {master_playlist}")
     logger.info(f"Playlist: {playlist}")
     logger.info(f"Segment payloads saved to: {payload_file}")
+    
+    # Always print verification results and return failed segments list
+    print("\n===== WATERMARK VERIFICATION RESULTS =====")
+    if failed_segments:
+        print(f"Failed to properly watermark {len(failed_segments)} segments:")
+        for failed in failed_segments:
+            print(f"  Segment {failed['segment_number']} ({failed['segment']})")
+    else:
+        print("All segments were watermarked successfully!")
+    
+    return failed_segments
 
 if __name__ == '__main__':
     main() 
