@@ -79,19 +79,22 @@ def extract_segment_number_from_filename(filename):
     
     return segment_number
 
-def generate_payload_for_segment(segment_number):
+def generate_payload_for_segment(segment_number, copy_index=0):
     """
-    Generate a unique payload based on segment number
+    Generate a unique payload based on segment number and copy index
     
     Args:
         segment_number: The segment number (0-based)
+        copy_index: The copy index for this segment (0-based)
         
     Returns:
-        np.array: Unique binary payload for the segment
+        np.array: Unique binary payload for the segment and copy
     """
-    # Use binary representation of segment number, padded to 8 bits
-    # For segment numbers > 255, we'll wrap around
-    binary = format(segment_number % 256, '08b')
+    # We'll use the top 4 bits for segment number (0-15) and bottom 4 bits for copy index (0-15)
+    # For segment numbers > 15, we'll wrap around
+    segment_bits = format(segment_number % 16, '04b')
+    copy_bits = format(copy_index % 16, '04b')
+    binary = segment_bits + copy_bits
     return np.array([int(bit) for bit in binary])
 
 # Custom extractor to collect patterns from each frame
@@ -139,7 +142,36 @@ class PatternCollectorExtractor:
         pattern = self.degenerator.degenerate(frame_yuv)
         return pattern
 
-def detect_patterns_in_segment(marked_file, expected_payload=None, segment_number=None):
+def decode_watermark_pattern(pattern):
+    """
+    Decode a watermark pattern into segment number and copy index
+    
+    Args:
+        pattern: The watermark pattern (numpy array or list of 8 bits)
+        
+    Returns:
+        tuple: (segment_number, copy_index)
+    """
+    if pattern is None:
+        return None, None
+        
+    # Convert to string
+    if isinstance(pattern, np.ndarray):
+        binary_str = ''.join(map(str, pattern))
+    else:
+        binary_str = ''.join(map(str, pattern))
+    
+    # Extract segment number (first 4 bits) and copy index (last 4 bits)
+    if len(binary_str) >= 8:
+        segment_bits = binary_str[:4]
+        copy_bits = binary_str[4:8]
+        segment_number = int(segment_bits, 2)
+        copy_index = int(copy_bits, 2)
+        return segment_number, copy_index
+    
+    return None, None
+
+def detect_patterns_in_segment(marked_file, expected_payload=None, segment_number=None, copy_index=None):
     """
     Detect patterns in each frame of a watermarked segment
     
@@ -147,26 +179,27 @@ def detect_patterns_in_segment(marked_file, expected_payload=None, segment_numbe
         marked_file: Path to watermarked segment
         expected_payload: Expected watermark payload
         segment_number: Segment number to derive expected payload if not provided
+        copy_index: Copy index to use when deriving expected payload
     
     Returns:
-        tuple: (most_common_pattern, frequency, success)
+        tuple: (most_common_pattern, frequency, success, detected_segment_number, detected_copy_index)
     """
     logger.info(f"Detecting patterns in {marked_file}")
     
     # If segment_number is provided but expected_payload isn't, derive it
     if expected_payload is None and segment_number is not None:
-        expected_payload = generate_payload_for_segment(segment_number)
+        expected_payload = generate_payload_for_segment(segment_number, copy_index or 0)
     
     # If neither is provided, try to extract segment number from filename
     if expected_payload is None and segment_number is None:
         segment_number = extract_segment_number_from_filename(marked_file)
         if segment_number is not None:
-            expected_payload = generate_payload_for_segment(segment_number)
+            expected_payload = generate_payload_for_segment(segment_number, copy_index or 0)
     
     # If we still don't have an expected payload, we can't verify
     if expected_payload is None:
         logger.warning(f"No expected payload for {marked_file}, cannot verify")
-        return None, 0, False
+        return None, 0, False, None, None
     
     r = FileDecoder(marked_file)
     degenerator = DeShuffler(key=0)
@@ -179,7 +212,7 @@ def detect_patterns_in_segment(marked_file, expected_payload=None, segment_numbe
     
     if most_common_pattern is None:
         logger.warning(f"No patterns found in {marked_file}")
-        return None, 0, False
+        return None, 0, False, None, None
     
     # Check if most common pattern matches expected payload
     if isinstance(expected_payload, np.ndarray):
@@ -188,10 +221,14 @@ def detect_patterns_in_segment(marked_file, expected_payload=None, segment_numbe
         # If expected_payload is a list (from JSON), convert to numpy array
         success = np.array_equal(most_common_pattern, np.array(expected_payload))
     
-    logger.info(f"Segment {segment_number}: most common pattern: {most_common_pattern}, "
-                f"expected: {expected_payload}, frequency: {frequency:.2f}, matches: {success}")
+    # Decode the detected pattern to segment number and copy index
+    detected_segment_number, detected_copy_index = decode_watermark_pattern(most_common_pattern)
     
-    return most_common_pattern, frequency, success
+    logger.info(f"Segment {segment_number}: most common pattern: {most_common_pattern}, "
+                f"expected: {expected_payload}, frequency: {frequency:.2f}, matches: {success}, "
+                f"detected segment: {detected_segment_number}, copy: {detected_copy_index}")
+    
+    return most_common_pattern, frequency, success, detected_segment_number, detected_copy_index
 
 def load_payload_mappings(payload_file):
     """
@@ -214,34 +251,65 @@ def load_payload_mappings(payload_file):
     
     return segment_payloads
 
+def load_segment_copies(copies_file):
+    """
+    Load segment copies information from a JSON file
+    
+    Args:
+        copies_file: Path to segment_copies.json file
+        
+    Returns:
+        dict: Segment copies information
+    """
+    if not os.path.exists(copies_file):
+        logger.warning(f"Copies file {copies_file} not found.")
+        return {}
+    
+    with open(copies_file, 'r') as f:
+        segment_copies = json.load(f)
+    
+    return segment_copies
+
 def main():
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Detect watermarks in a leaked video file')
-    parser.add_argument('input_file', help='Path to leaked MP4 video file')
+    parser = argparse.ArgumentParser(description='Detect watermarks in leaked video')
+    parser.add_argument('input_file', help='Path to input leaked video file')
     parser.add_argument('output_dir', help='Directory to store detection results')
-    parser.add_argument('--payload-file', 
-                       help='Path to segment_payloads.json file (if not provided, will generate payloads)')
+    parser.add_argument('--payload-file', help='Path to segment_payloads.json from watermarking process')
+    parser.add_argument('--copies-file', help='Path to segment_copies.json from watermarking process')
     parser.add_argument('--segment-duration', type=float, default=2.0, 
-                       help='Duration of each segment in seconds (default: 2.0)')
+                        help='Duration of each segment in seconds (default: 2.0)')
     parser.add_argument('--clean', action='store_true', 
-                       help='Clean output directory before processing')
+                        help='Clean output directory before processing')
+    parser.add_argument('--max-copies', type=int, default=3,
+                        help='Maximum number of copies to check for each segment (default: 3)')
     args = parser.parse_args()
     
-    # Create directory structure
-    base_dir = args.output_dir
-    segments_dir = os.path.join(base_dir, 'segments')
+    # Check if output_dir is inside the watermarking output directory
+    # If the output_dir is 'detection' or starts with 'detection/',
+    # and we have a path for copies_file, put detection inside that folder structure
+    if args.copies_file and (args.output_dir == 'detection' or args.output_dir.startswith('detection/')):
+        watermark_base_dir = os.path.dirname(os.path.abspath(args.copies_file))
+        output_dir = os.path.join(watermark_base_dir, args.output_dir)
+    else:
+        output_dir = args.output_dir
+    
+    segments_dir = os.path.join(output_dir, 'segments')
     
     # Clean directory if requested
-    if args.clean and os.path.exists(base_dir):
-        shutil.rmtree(base_dir)
+    if args.clean and os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
     
     # Create required directories
-    for directory in [base_dir, segments_dir]:
+    for directory in [output_dir, segments_dir]:
         os.makedirs(directory, exist_ok=True)
     
     # Step 1: Load segment payload mappings if available
     payload_file = args.payload_file
     segment_payloads = load_payload_mappings(payload_file) if payload_file else {}
+    
+    # Load segment copies information if available
+    copies_file = args.copies_file
+    segment_copies_info = load_segment_copies(copies_file) if copies_file else {}
     
     # Step 2: Segment the leaked video
     logger.info(f"Step 1: Segmenting leaked video {args.input_file}")
@@ -256,23 +324,47 @@ def main():
     
     for segment in segments:
         segment_number = extract_segment_number_from_filename(segment)
-        # Try to find expected payload in mappings, otherwise None
-        expected_payload = segment_payloads.get(str(segment_number)) if segment_payloads else None
+        detected_copy = None
+        best_match_frequency = 0
         
-        most_common_pattern, frequency, success = detect_patterns_in_segment(
-            segment, expected_payload, segment_number)
+        # First, check using the payload mappings if available
+        if segment_payloads:
+            # Try to find the copy that matches best by checking all possible copies
+            for copy_index in range(args.max_copies):
+                # Try to find expected payload for this segment+copy
+                expected_payload = segment_payloads.get(f"{segment_number}_{copy_index}")
+                if expected_payload is None:
+                    continue
+                
+                most_common_pattern, frequency, success, detected_segment, detected_copy_index = detect_patterns_in_segment(
+                    segment, expected_payload, segment_number, copy_index)
+                
+                if success and frequency > best_match_frequency:
+                    best_match_frequency = frequency
+                    detected_copy = copy_index
+        else:
+            # If no payload mappings, just try to detect the pattern and decode it
+            most_common_pattern, frequency, _, detected_segment, detected_copy_index = detect_patterns_in_segment(
+                segment, None, segment_number)
+            
+            # If we were able to decode a segment number and copy index
+            if detected_segment is not None and detected_copy_index is not None:
+                # Check if detected segment matches the expected one
+                if detected_segment == segment_number % 16:  # Match with modulo for segment numbers > 15
+                    detected_copy = detected_copy_index
+                    best_match_frequency = frequency
         
+        # Record the results
         segment_results.append({
             'segment': segment,
             'segment_number': segment_number,
-            'pattern': most_common_pattern.tolist() if most_common_pattern is not None else None,
-            'expected_pattern': expected_payload,
-            'frequency': frequency,
-            'success': success
+            'detected_copy_index': detected_copy,
+            'match_frequency': best_match_frequency,
+            'success': detected_copy is not None
         })
     
     # Step 4: Save and output results
-    results_file = os.path.join(base_dir, 'detection_results.json')
+    results_file = os.path.join(output_dir, 'detection_results.json')
     
     # Convert results to JSON-serializable format
     json_results = []
@@ -280,10 +372,9 @@ def main():
         json_results.append({
             'segment': os.path.basename(result['segment']),
             'segment_number': result['segment_number'],
-            'detected_pattern': result['pattern'],
-            'expected_pattern': result['expected_pattern'],
-            'frequency': result['frequency'],
-            'matches_expected': result['success']
+            'detected_copy_index': result['detected_copy_index'],
+            'match_frequency': result['match_frequency'],
+            'success': result['success']
         })
     
     with open(results_file, 'w') as f:
@@ -293,44 +384,49 @@ def main():
     print("\n===== WATERMARK DETECTION RESULTS =====")
     for result in segment_results:
         segment_num = result['segment_number']
+        copy_index = result['detected_copy_index']
         print(f"Segment {segment_num} ({os.path.basename(result['segment'])}):")
-        print(f"  Detected pattern: {result['pattern']}")
-        if result['expected_pattern']:
-            print(f"  Expected pattern: {result['expected_pattern']}")
-            print(f"  Matches expected: {result['success']}")
-        print(f"  Pattern frequency: {result['frequency']:.2f}")
-        
-        # Convert to binary if available
-        if result['pattern']:
-            binary_str = ''.join(map(str, result['pattern']))
-            decimal_value = int(binary_str, 2)
-            print(f"  Binary: {binary_str} (Decimal: {decimal_value})")
-        
+        if copy_index is not None:
+            print(f"  Detected copy index: {copy_index}")
+            print(f"  Match frequency: {result['match_frequency']:.2f}")
+        else:
+            print("  No watermark copy identified")
         print("-------------------------------")
     
-    # Calculate overall success rate if expected patterns are available
-    if any(r['expected_pattern'] for r in segment_results):
-        success_count = sum(1 for r in segment_results if r['success'])
-        total_count = sum(1 for r in segment_results if r['expected_pattern'] is not None)
-        success_rate = success_count / total_count if total_count > 0 else 0
-        
-        print("\n===== DETECTION SUMMARY =====")
-        print(f"Total segments: {len(segment_results)}")
-        print(f"Segments with expected patterns: {total_count}")
-        print(f"Successfully detected patterns: {success_count}")
-        print(f"Success rate: {success_rate*100:.2f}%")
+    # Calculate overall success rate
+    success_count = sum(1 for r in segment_results if r['success'])
+    success_rate = success_count / len(segment_results) if segment_results else 0
     
-    # Ordered sequence of watermarks
-    print("\n===== WATERMARK SEQUENCE =====")
+    print("\n===== DETECTION SUMMARY =====")
+    print(f"Total segments: {len(segment_results)}")
+    print(f"Successfully identified copy indexes: {success_count}")
+    print(f"Success rate: {success_rate*100:.2f}%")
+    
+    # Ordered sequence of copy indexes
+    print("\n===== WATERMARKED COPY SEQUENCE =====")
     ordered_results = sorted(segment_results, key=lambda r: r['segment_number'] if r['segment_number'] is not None else float('inf'))
     
+    copy_sequence = []
     for result in ordered_results:
-        if result['pattern'] is not None:
-            binary_str = ''.join(map(str, result['pattern']))
-            decimal_value = int(binary_str, 2)
-            print(f"Segment {result['segment_number']}: {binary_str} (Decimal: {decimal_value})")
+        copy_index = result['detected_copy_index']
+        if copy_index is not None:
+            copy_sequence.append(copy_index)
+            print(f"Segment {result['segment_number']}: Copy {copy_index}")
+        else:
+            copy_sequence.append(None)
+            print(f"Segment {result['segment_number']}: Unknown copy")
+    
+    print("\n===== FINGERPRINT SEQUENCE =====")
+    print(f"Copy sequence: {copy_sequence}")
+    
+    # Create a compact fingerprint from the copy sequence
+    if all(copy is not None for copy in copy_sequence):
+        fingerprint = ''.join([str(copy) for copy in copy_sequence])
+        print(f"Copy fingerprint: {fingerprint}")
     
     logger.info(f"Detection results saved to {results_file}")
+    
+    return json_results
 
 if __name__ == '__main__':
     main() 

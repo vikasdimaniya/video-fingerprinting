@@ -147,6 +147,9 @@ def convert_segments_to_hls(segment_files, hls_output_dir):
     Args:
         segment_files: List of MP4 segment files
         hls_output_dir: Directory to output HLS files
+        
+    Returns:
+        tuple: (master_playlist, playlist, segment_map)
     """
     logger.info(f"Converting {len(segment_files)} segments to HLS format")
     
@@ -192,7 +195,20 @@ def convert_segments_to_hls(segment_files, hls_output_dir):
     # Clean up the temp file
     os.unlink(concat_file)
     
-    return master_playlist, playlist
+    # Create a mapping between original segment files and HLS segments
+    segment_map = {}
+    m4s_files = sorted([f for f in os.listdir(hls_output_dir) if f.endswith('.m4s')])
+    
+    if len(m4s_files) != len(segment_files):
+        logger.warning(f"Number of M4S files ({len(m4s_files)}) doesn't match input segments ({len(segment_files)})")
+    
+    # Map each m4s file to its corresponding input segment
+    # The order should be preserved from the concat file
+    for i, m4s_file in enumerate(m4s_files):
+        if i < len(segment_files):
+            segment_map[m4s_file] = os.path.basename(segment_files[i])
+    
+    return master_playlist, playlist, segment_map
 
 def detect_patterns_in_segment(marked_file, expected_payload=None, segment_number=None):
     """
@@ -286,7 +302,7 @@ def main():
                         help='Duration of each segment in seconds (default: 2.0)')
     parser.add_argument('--clean', action='store_true', 
                         help='Clean output directory before processing')
-    parser.add_argument('--copies', type=int, default=1, 
+    parser.add_argument('--copies', type=int, default=1,
                         help='Number of differently watermarked copies to create for each segment (default: 1)')
     args = parser.parse_args()
     
@@ -344,23 +360,17 @@ def main():
     for marked_segment in marked_segments:
         # Extract segment number and copy index from filename
         basename = os.path.basename(marked_segment)
-        parts = basename.split('_')
         
         # Extract segment number and copy index
-        segment_number = None
-        copy_index = 0
-        
-        # Try to parse "marked_seg{segment_number}_copy{copy_index}.mp4" format
         import re
-        seg_match = re.search(r'seg(\d+)', basename)
-        copy_match = re.search(r'copy(\d+)', basename)
-        
-        if seg_match and copy_match:
+        seg_match = re.search(r'seg(\d+)_copy(\d+)', basename)
+        if seg_match:
             segment_number = int(seg_match.group(1))
-            copy_index = int(copy_match.group(1))
+            copy_index = int(seg_match.group(2))
         else:
             # Fallback to old method
             segment_number = extract_segment_number_from_filename(marked_segment)
+            copy_index = 0
         
         # Get expected payload for this segment and copy
         expected_payload = segment_payloads.get(f"{segment_number}_{copy_index}")
@@ -390,7 +400,7 @@ def main():
     
     # Step 3: Convert marked segments to HLS
     logger.info("Step 3: Converting marked segments to HLS")
-    master_playlist, playlist = convert_segments_to_hls(marked_segments, hls_dir)
+    master_playlist, playlist, segment_map = convert_segments_to_hls(marked_segments, hls_dir)
     
     # Save segment payloads and copies information for later verification
     payload_file = os.path.join(base_dir, 'segment_payloads.json')
@@ -408,6 +418,14 @@ def main():
     with open(copies_file, 'w') as f:
         json.dump(segment_copies_info, f, indent=2)
     
+    # Save segment mapping information (m4s to original watermarked segment)
+    mapping_file = os.path.join(base_dir, 'segment_mapping.json')
+    with open(mapping_file, 'w') as f:
+        json.dump({
+            "hls_to_watermarked": segment_map,
+            "description": "Maps HLS m4s files to their source watermarked segment files"
+        }, f, indent=2)
+    
     # Save failed segments information if any
     if failed_segments:
         failed_file = os.path.join(base_dir, 'failed_segments.json')
@@ -422,6 +440,7 @@ def main():
     logger.info(f"Playlist: {playlist}")
     logger.info(f"Segment payloads saved to: {payload_file}")
     logger.info(f"Segment copies information saved to: {copies_file}")
+    logger.info(f"Segment mapping information saved to: {mapping_file}")
     
     # Always print verification results and return failed segments list
     print("\n===== WATERMARK VERIFICATION RESULTS =====")
