@@ -24,19 +24,22 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(name)s  %(message)s')
 
-def generate_payload_for_segment(segment_number):
+def generate_payload_for_segment(segment_number, copy_index=0):
     """
-    Generate a unique payload based on segment number
+    Generate a unique payload based on segment number and copy index
     
     Args:
         segment_number: The segment number (0-based)
+        copy_index: The copy index for this segment (0-based)
         
     Returns:
-        np.array: Unique binary payload for the segment
+        np.array: Unique binary payload for the segment and copy
     """
-    # Use binary representation of segment number, padded to 8 bits
-    # For segment numbers > 255, we'll wrap around
-    binary = format(segment_number % 256, '08b')
+    # We'll use the top 4 bits for segment number (0-15) and bottom 4 bits for copy index (0-15)
+    # For segment numbers > 15, we'll wrap around
+    segment_bits = format(segment_number % 16, '04b')
+    copy_bits = format(copy_index % 16, '04b')
+    binary = segment_bits + copy_bits
     return np.array([int(bit) for bit in binary])
 
 def segment_video(input_file, output_pattern, segment_duration=2):
@@ -67,7 +70,7 @@ def segment_video(input_file, output_pattern, segment_duration=2):
     
     return sorted(Path(os.path.dirname(output_pattern)).glob('*.mp4'))
 
-def watermark_segment(segment_file, output_file, segment_number):
+def watermark_segment(segment_file, output_file, segment_number, copy_index=0):
     """
     Watermark a single video segment using the mark.py logic
     
@@ -75,12 +78,13 @@ def watermark_segment(segment_file, output_file, segment_number):
         segment_file: Path to input segment
         output_file: Path for watermarked output
         segment_number: The segment number to determine the payload
+        copy_index: The copy index for this segment variant
     """
-    logger.info(f"Watermarking {segment_file} to {output_file} with segment number {segment_number}")
+    logger.info(f"Watermarking {segment_file} to {output_file} with segment number {segment_number}, copy {copy_index}")
     
-    # Define watermark payload based on segment number
-    payload = generate_payload_for_segment(segment_number)
-    logger.info(f"Segment {segment_number} payload: {payload}")
+    # Define watermark payload based on segment number and copy index
+    payload = generate_payload_for_segment(segment_number, copy_index)
+    logger.info(f"Segment {segment_number}, copy {copy_index} payload: {payload}")
     
     r = FileDecoder(segment_file)
     w = FileEncoder(output_file, r.width, r.height)
@@ -98,7 +102,11 @@ def watermark_segment(segment_file, output_file, segment_number):
     video_embedder = Embedder(r, frame_embedder, w)
     video_embedder.start()
     
-    return payload.tolist()  # Convert to list for JSON serialization
+    return {
+        "payload": payload.tolist(),  # Convert to list for JSON serialization
+        "segment_number": segment_number,
+        "copy_index": copy_index
+    }
 
 def extract_segment_number_from_filename(filename):
     """
@@ -278,6 +286,8 @@ def main():
                         help='Duration of each segment in seconds (default: 2.0)')
     parser.add_argument('--clean', action='store_true', 
                         help='Clean output directory before processing')
+    parser.add_argument('--copies', type=int, default=1, 
+                        help='Number of differently watermarked copies to create for each segment (default: 1)')
     args = parser.parse_args()
     
     # Create directory structure
@@ -301,25 +311,59 @@ def main():
                             args.segment_duration)
     logger.info(f"Created {len(segments)} segments")
     
-    # Step 2: Watermark each segment with a unique pattern
-    logger.info("Step 2: Watermarking segments with unique patterns")
+    # Step 2: Create N copies of each segment with unique watermarks
+    logger.info(f"Step 2: Creating {args.copies} watermarked copies of each segment")
     marked_segments = []
     segment_payloads = {}  # Keep track of which payload was used for each segment
+    segment_copies = {}    # Track all copies of each segment
     
     for segment in segments:
-        output_file = os.path.join(marked_segments_dir, f"marked_{os.path.basename(segment)}")
         segment_number = extract_segment_number_from_filename(segment)
-        payload = watermark_segment(segment, output_file, segment_number)
-        marked_segments.append(output_file)
-        segment_payloads[str(segment_number)] = payload  # Convert keys to strings for JSON
+        segment_copies[str(segment_number)] = []
+        
+        for copy_index in range(args.copies):
+            output_file = os.path.join(marked_segments_dir, f"marked_seg{segment_number}_copy{copy_index}.mp4")
+            watermark_info = watermark_segment(segment, output_file, segment_number, copy_index)
+            marked_segments.append(output_file)
+            
+            # Store information about this copy
+            copy_info = {
+                "file": os.path.basename(output_file),
+                "payload": watermark_info["payload"],
+                "copy_index": copy_index
+            }
+            segment_copies[str(segment_number)].append(copy_info)
+            
+            # Also store in segment_payloads for backward compatibility
+            segment_payloads[f"{segment_number}_{copy_index}"] = watermark_info["payload"]
     
     # Always verify watermarking was successful
     failed_segments = []
     logger.info("Verifying watermarks in segments")
     
     for marked_segment in marked_segments:
-        segment_number = extract_segment_number_from_filename(marked_segment)
-        expected_payload = segment_payloads.get(str(segment_number))
+        # Extract segment number and copy index from filename
+        basename = os.path.basename(marked_segment)
+        parts = basename.split('_')
+        
+        # Extract segment number and copy index
+        segment_number = None
+        copy_index = 0
+        
+        # Try to parse "marked_seg{segment_number}_copy{copy_index}.mp4" format
+        import re
+        seg_match = re.search(r'seg(\d+)', basename)
+        copy_match = re.search(r'copy(\d+)', basename)
+        
+        if seg_match and copy_match:
+            segment_number = int(seg_match.group(1))
+            copy_index = int(copy_match.group(1))
+        else:
+            # Fallback to old method
+            segment_number = extract_segment_number_from_filename(marked_segment)
+        
+        # Get expected payload for this segment and copy
+        expected_payload = segment_payloads.get(f"{segment_number}_{copy_index}")
         
         most_common_pattern, frequency, success = detect_patterns_in_segment(
             marked_segment, expected_payload, segment_number)
@@ -328,6 +372,7 @@ def main():
             failed_segments.append({
                 'segment': os.path.basename(marked_segment),
                 'segment_number': segment_number,
+                'copy_index': copy_index,
                 'expected_pattern': expected_payload,
                 'detected_pattern': most_common_pattern.tolist() if most_common_pattern is not None else None,
                 'frequency': frequency
@@ -337,7 +382,7 @@ def main():
     if failed_segments:
         logger.warning(f"Failed to properly watermark {len(failed_segments)} segments:")
         for failed in failed_segments:
-            logger.warning(f"  Segment {failed['segment_number']} ({failed['segment']}): "
+            logger.warning(f"  Segment {failed['segment_number']} copy {failed['copy_index']} ({failed['segment']}): "
                           f"expected {failed['expected_pattern']}, detected {failed['detected_pattern']}, "
                           f"frequency: {failed['frequency']:.2f}")
     else:
@@ -347,10 +392,21 @@ def main():
     logger.info("Step 3: Converting marked segments to HLS")
     master_playlist, playlist = convert_segments_to_hls(marked_segments, hls_dir)
     
-    # Save segment payloads for later verification
+    # Save segment payloads and copies information for later verification
     payload_file = os.path.join(base_dir, 'segment_payloads.json')
     with open(payload_file, 'w') as f:
         json.dump(segment_payloads, f, indent=2)
+    
+    # Save detailed segment copies information
+    copies_file = os.path.join(base_dir, 'segment_copies.json')
+    segment_copies_info = {
+        "total_segments": len(segments),
+        "copies_per_segment": args.copies,
+        "total_marked_segments": len(marked_segments),
+        "segments": segment_copies
+    }
+    with open(copies_file, 'w') as f:
+        json.dump(segment_copies_info, f, indent=2)
     
     # Save failed segments information if any
     if failed_segments:
@@ -361,16 +417,18 @@ def main():
     
     # Final output
     logger.info(f"Watermarking and HLS conversion complete")
+    logger.info(f"Created {args.copies} watermarked copies of each segment")
     logger.info(f"Master playlist: {master_playlist}")
     logger.info(f"Playlist: {playlist}")
     logger.info(f"Segment payloads saved to: {payload_file}")
+    logger.info(f"Segment copies information saved to: {copies_file}")
     
     # Always print verification results and return failed segments list
     print("\n===== WATERMARK VERIFICATION RESULTS =====")
     if failed_segments:
         print(f"Failed to properly watermark {len(failed_segments)} segments:")
         for failed in failed_segments:
-            print(f"  Segment {failed['segment_number']} ({failed['segment']})")
+            print(f"  Segment {failed['segment_number']} copy {failed['copy_index']} ({failed['segment']})")
     else:
         print("All segments were watermarked successfully!")
     
