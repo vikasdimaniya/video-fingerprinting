@@ -16,3 +16,6 @@ dist
 
 # Output
 output/*
+api/processed/*
+api/videos/*
+video_content

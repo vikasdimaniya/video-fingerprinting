@@ -1,0 +1,342 @@
+{% extends "base.html" %}
+
+{% block title %}Video Watermarking Viewer{% endblock %}
+
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+{% endblock %}
+
+{% block style %}
+.container {
+    background-color: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+.video-container {
+    width: 100%;
+    margin-bottom: 20px;
+}
+video {
+    width: 100%;
+    max-height: 600px;
+    background-color: #000;
+}
+.controls {
+    margin: 20px 0;
+    display: flex;
+    gap: 10px;
+}
+button {
+    padding: 10px 20px;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+}
+button:hover {
+    background-color: #0056b3;
+}
+.watermark-info {
+    background-color: #f8f9fa;
+    padding: 15px;
+    border-radius: 4px;
+    margin: 20px 0;
+    border: 1px solid #dee2e6;
+    display: none;  /* Hidden by default */
+}
+.segment-pattern {
+    margin: 10px 0;
+    padding: 10px;
+    background-color: white;
+    border: 1px solid #eee;
+    border-radius: 4px;
+}
+.segment-header {
+    font-weight: bold;
+    color: #495057;
+    margin-bottom: 5px;
+}
+.pattern {
+    font-family: monospace;
+    font-size: 18px;
+    color: #2c3e50;
+    padding: 5px;
+    background-color: #f1f3f5;
+    border-radius: 3px;
+    display: inline-block;
+}
+.error {
+    color: #dc3545;
+    background-color: #f8d7da;
+    padding: 10px;
+    border-radius: 4px;
+    margin-bottom: 20px;
+}
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1>Video Watermarking Viewer</h1>
+    
+    <div id="error" class="error" style="display: none;">
+    </div>
+    
+    <div class="video-container">
+        <video id="videoPlayer" controls style="display: none;">
+            <source id="videoSource" type="application/x-mpegURL">
+            Your browser does not support the video tag.
+        </video>
+        <div id="videoPlaceholder" style="text-align: center; padding: 20px; background: #f8f9fa; border-radius: 4px;">
+            Enter your username and click "Start View" to begin watching
+        </div>
+    </div>
+
+    <div id="watermarkInfo" class="watermark-info">
+        <h2>Your Watermark Patterns</h2>
+        <p>Each pattern is unique to your viewing session and is embedded in different segments of the video.</p>
+        <div id="watermarkPatterns"></div>
+    </div>
+    
+    <div class="controls">
+        <div class="input-group">
+            <input type="text" id="username" placeholder="Enter your username" required>
+        </div>
+        <button onclick="startView()">Start View</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let username = '';
+    let viewStarted = false;
+    let hls = null;
+    let currentViewId = '';
+
+    function initializeVideoPlayer() {
+        const video = document.getElementById('videoPlayer');
+        const placeholder = document.getElementById('videoPlaceholder');
+        const source = document.getElementById('videoSource');
+        
+        console.log('Initializing video player with view ID:', currentViewId);
+        
+        // Show video player, hide placeholder
+        video.style.display = 'block';
+        placeholder.style.display = 'none';
+        
+        if (Hls.isSupported()) {
+            console.log('HLS.js is supported');
+            if (hls) {
+                hls.destroy();
+            }
+            
+            hls = new Hls({
+                debug: true,
+                maxLoadingRetry: 3,  // Limit retries
+                manifestLoadingMaxRetry: 2,  // Limit manifest retries
+                fragLoadingMaxRetry: 2,      // Limit fragment retries
+                levelLoadingMaxRetry: 2,      // Limit level retries
+                fragLoadingRetryDelay: 500,   // Start with 500ms delay
+                manifestLoadingRetryDelay: 500,
+                levelLoadingRetryDelay: 500,
+                fragLoadingMaxRetryTimeout: 2000,  // Max 2s retry delay
+                manifestLoadingMaxRetryTimeout: 2000,
+                levelLoadingMaxRetryTimeout: 2000,
+                xhrSetup: function(xhr, url) {
+                    console.log('XHR setup for URL:', url);
+                    // If the URL is for a segment file, use the /hls/ prefix
+                    if (url.endsWith('.m4s')) {
+                        const segmentUrl = '/hls/' + url.split('/').pop();
+                        console.log('Loading segment:', segmentUrl);
+                        xhr.open('GET', segmentUrl, true);
+                    } else if (url.includes('master.m3u8')) {
+                        const playlistUrl = '/view/' + currentViewId;
+                        console.log('Loading playlist:', playlistUrl);
+                        xhr.open('GET', playlistUrl, true);
+                    }
+                }
+            });
+            
+            const sourceUrl = '/view/' + currentViewId;
+            console.log('Loading source:', sourceUrl);
+            source.src = sourceUrl;
+            hls.loadSource(sourceUrl);
+            hls.attachMedia(video);
+            
+            let errorCount = 0;
+            const maxErrors = 3;
+            
+            hls.on(Hls.Events.MANIFEST_LOADING, function() {
+                console.log('Manifest loading...');
+            });
+            
+            hls.on(Hls.Events.MANIFEST_LOADED, function() {
+                console.log('Manifest loaded');
+            });
+            
+            hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                console.log('Manifest parsed, starting playback');
+                video.play().catch(function(error) {
+                    console.error('Error playing video:', error);
+                    showError('Error playing video: ' + error.message);
+                });
+            });
+            
+            hls.on(Hls.Events.ERROR, function(event, data) {
+                console.error('HLS error:', data);
+                errorCount++;
+                
+                if (data.fatal || errorCount >= maxErrors) {
+                    switch(data.type) {
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            console.error('Fatal network error, stopping playback');
+                            hls.destroy();
+                            showError('Network error: Unable to load video segments. Please try again.');
+                            break;
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            console.error('Fatal media error, stopping playback');
+                            hls.destroy();
+                            showError('Media error: Video format not supported or corrupted.');
+                            break;
+                        default:
+                            console.error('Fatal error, stopping playback');
+                            hls.destroy();
+                            showError('Fatal error: Unable to play video. Please try again.');
+                            break;
+                    }
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    hls.recoverMediaError();
+                } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    hls.startLoad();
+                }
+            });
+        }
+        // For browsers that natively support HLS
+        else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            console.log('Using native HLS support');
+            const sourceUrl = '/view/' + currentViewId;
+            source.src = sourceUrl;
+            video.addEventListener('loadedmetadata', function() {
+                console.log('Video metadata loaded, starting playback');
+                video.play().catch(function(error) {
+                    console.error('Error playing video:', error);
+                    showError('Error playing video: ' + error.message);
+                });
+            });
+            
+            video.addEventListener('error', function(error) {
+                console.error('Video error:', error);
+                showError('Error playing video: Unable to load video segments.');
+            });
+        } else {
+            console.error('HLS is not supported in this browser');
+            showError('Your browser does not support HLS video playback');
+        }
+    }
+
+    function showError(message) {
+        const errorDiv = document.getElementById('error');
+        const watermarkInfo = document.getElementById('watermarkInfo');
+        
+        if (errorDiv) {
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+        
+        if (watermarkInfo) {
+            watermarkInfo.style.display = 'none';
+        }
+    }
+
+    async function startView() {
+        const usernameInput = document.getElementById('username');
+        
+        if (!usernameInput || !usernameInput.value) {
+            showError('Please enter a username');
+            return;
+        }
+        
+        try {
+            console.log('Starting view for user:', usernameInput.value);
+            const response = await fetch('/start-view', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    username: usernameInput.value
+                })
+            });
+            
+            const data = await response.json();
+            console.log('Start view response:', data);
+            
+            if (data.status === 'success') {
+                // Store the view ID
+                currentViewId = data.view_id;
+                console.log('Got view ID:', currentViewId);
+                
+                // Show watermark patterns
+                displayWatermarkPatterns(data.segment_patterns);
+                
+                const watermarkInfo = document.getElementById('watermarkInfo');
+                const errorDiv = document.getElementById('error');
+                
+                if (watermarkInfo) {
+                    watermarkInfo.style.display = 'block';
+                }
+                if (errorDiv) {
+                    errorDiv.style.display = 'none';
+                }
+                
+                // Initialize video player with the new view
+                initializeVideoPlayer();
+            } else {
+                showError(data.error || 'Failed to start view');
+            }
+        } catch (error) {
+            console.error('Error in startView:', error);
+            showError('Error starting view: ' + error.message);
+        }
+    }
+
+    function displayWatermarkPatterns(patterns) {
+        const container = document.getElementById('watermarkPatterns');
+        if (!container) {
+            console.error('Watermark patterns container not found');
+            return;
+        }
+        
+        container.innerHTML = '';
+        
+        // Sort patterns by segment number
+        const sortedPatterns = Object.entries(patterns)
+            .sort(([a], [b]) => {
+                const segA = parseInt(a.match(/\d+/)[0]);
+                const segB = parseInt(b.match(/\d+/)[0]);
+                return segA - segB;
+            });
+        
+        sortedPatterns.forEach(([segment, info]) => {
+            const patternDiv = document.createElement('div');
+            patternDiv.className = 'segment-pattern';
+            
+            const segmentNumber = segment.match(/\d+/)[0];
+            const copyIndex = segment.match(/copy(\d+)/)[1];
+            
+            patternDiv.innerHTML = `
+                <div class="segment-header">
+                    <h3>Segment ${segmentNumber}</h3>
+                    <span class="copy-index">Copy ${copyIndex}</span>
+                </div>
+                <div class="pattern">${info.payload.join('')}</div>
+            `;
+            
+            container.appendChild(patternDiv);
+        });
+    }
+</script>
+{% endblock %} 

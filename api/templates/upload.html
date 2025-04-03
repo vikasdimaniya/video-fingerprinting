@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block title %}Upload Video{% endblock %}
+
+{% block style %}
+.upload-container {
+    background-color: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+.upload-form {
+    margin-top: 20px;
+}
+.form-group {
+    margin-bottom: 15px;
+}
+.form-group label {
+    display: block;
+    margin-bottom: 5px;
+    color: #333;
+}
+.form-group input[type="file"] {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    margin-bottom: 10px;
+}
+.form-group input[type="number"] {
+    width: 100px;
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+button {
+    padding: 10px 20px;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+}
+button:hover {
+    background-color: #0056b3;
+}
+.error {
+    color: #dc3545;
+    background-color: #f8d7da;
+    padding: 10px;
+    border-radius: 4px;
+    margin-bottom: 20px;
+}
+{% endblock %}
+
+{% block content %}
+<div class="upload-container">
+    <h1>Upload Video</h1>
+    
+    {% if error %}
+    <div class="error">
+        {{ error }}
+    </div>
+    {% endif %}
+    
+    <form class="upload-form" action="/upload" method="post" enctype="multipart/form-data">
+        <div class="form-group">
+            <label for="file">Select Video File:</label>
+            <input type="file" id="file" name="file" accept="video/*" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="copies">Number of Copies:</label>
+            <input type="number" id="copies" name="copies" value="3" min="1" max="10">
+        </div>
+        
+        <button type="submit">Upload and Process</button>
+    </form>
+</div>
+{% endblock %} 

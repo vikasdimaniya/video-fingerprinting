@@ -22,6 +22,10 @@ from offmark.generator.shuffler import Shuffler
 
 this_dir = os.path.dirname(__file__)
 
+# Create output directory if it doesn't exist
+output_dir = os.path.join(this_dir, 'out')
+os.makedirs(output_dir, exist_ok=True)
+
 key1 = 0
 
 generators = [
@@ -103,7 +107,11 @@ diff = diff.clip(0, 255)
 diff_path = os.path.join(this_dir, 'out', 'diff.jpeg')
 cv2.imwrite(diff_path, diff)
 
-bgr = cv2.imread(output_path).astype(np.float32)
+# Read the watermarked image back
+bgr = cv2.imread(output_path)
+if bgr is None:
+    raise RuntimeError(f"Failed to read watermarked image from {output_path}. Make sure the file was written successfully.")
+bgr = bgr.astype(np.float32)
 yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV)
 
 # decode

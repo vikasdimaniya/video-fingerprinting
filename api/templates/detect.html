@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+
+{% block title %}Detect Watermark{% endblock %}
+
+{% block style %}
+.detect-container {
+    background-color: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+.detect-form {
+    margin-top: 20px;
+}
+.form-group {
+    margin-bottom: 15px;
+}
+.form-group label {
+    display: block;
+    margin-bottom: 5px;
+    color: #333;
+}
+.form-group input[type="file"] {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+button {
+    padding: 10px 20px;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+}
+button:hover {
+    background-color: #0056b3;
+}
+.results {
+    margin-top: 20px;
+    padding: 15px;
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    display: none;
+}
+.results.active {
+    display: block;
+}
+.result-item {
+    margin-bottom: 15px;
+    padding-bottom: 15px;
+    border-bottom: 1px solid #eee;
+}
+.result-item:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+}
+.pattern {
+    font-family: monospace;
+    font-size: 16px;
+    background-color: #f8f9fa;
+    padding: 5px 10px;
+    border-radius: 4px;
+    display: inline-block;
+}
+.error {
+    color: #dc3545;
+    background-color: #f8d7da;
+    padding: 10px;
+    border-radius: 4px;
+    margin-bottom: 20px;
+}
+{% endblock %}
+
+{% block content %}
+<div class="detect-container">
+    <h1>Detect Video Watermark</h1>
+    
+    <p>Upload a video segment to detect its watermark and identify the source.</p>
+    
+    <form id="detectForm" class="detect-form">
+        <div class="form-group">
+            <label for="file">Select Video Segment:</label>
+            <input type="file" id="file" name="file" accept="video/*" required>
+        </div>
+        
+        <button type="submit">Detect Watermark</button>
+    </form>
+    
+    <div id="results" class="results">
+        <h3>Detection Results</h3>
+        <div id="resultsContent"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.getElementById('detectForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        
+        const formData = new FormData();
+        const fileInput = document.getElementById('file');
+        formData.append('file', fileInput.files[0]);
+        
+        try {
+            const response = await fetch('/detect', {
+                method: 'POST',
+                body: formData
+            });
+            
+            const data = await response.json();
+            const results = document.getElementById('results');
+            const resultsContent = document.getElementById('resultsContent');
+            
+            results.classList.add('active');
+            
+            if (data.error) {
+                resultsContent.innerHTML = `<div class="error">${data.error}</div>`;
+                return;
+            }
+            
+            if (data.status === 'success') {
+                let html = '';
+                data.matches.forEach(match => {
+                    html += `
+                        <div class="result-item">
+                            <p><strong>Username:</strong> ${match.username}</p>
+                            <p><strong>Timestamp:</strong> ${new Date(match.timestamp).toLocaleString()}</p>
+                            <p><strong>Pattern:</strong> <span class="pattern">${match.payload.join('')}</span></p>
+                            <p><strong>Segment Number:</strong> ${match.segment_number}</p>
+                            <p><strong>Confidence:</strong> ${(match.frequency * 100).toFixed(1)}%</p>
+                        </div>
+                    `;
+                });
+                resultsContent.innerHTML = html;
+            } else {
+                resultsContent.innerHTML = `
+                    <div class="error">
+                        No matches found.<br>
+                        ${data.note || ''}
+                    </div>
+                `;
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            const results = document.getElementById('results');
+            const resultsContent = document.getElementById('resultsContent');
+            results.classList.add('active');
+            resultsContent.innerHTML = `<div class="error">An error occurred while detecting the watermark.</div>`;
+        }
+    });
+</script>
+{% endblock %} 
