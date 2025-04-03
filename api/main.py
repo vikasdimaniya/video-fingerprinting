@@ -22,6 +22,7 @@ from tests.mark_video_to_hls import (
     detect_patterns_in_segment, generate_payload_for_segment
 )
 from tests.detect_watermarks import decode_watermark_pattern
+from tests.generate_leak import create_custom_hls_playlist, concatenate_segments
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -72,8 +73,11 @@ def process_video_to_hls(input_path: Path, output_dir: Path, base_payload: np.nd
                 shutil.rmtree(directory)
             directory.mkdir(exist_ok=True)
         
-        # Clean up HLS directory but don't delete it
-        for file in hls_dir.glob("*"):
+        # Create HLS directory if it doesn't exist
+        hls_dir.mkdir(exist_ok=True)
+        
+        # Clean up only segment files in HLS directory
+        for file in hls_dir.glob("*.m4s"):
             file.unlink()
         
         # Step 1: Segment the video
@@ -87,8 +91,10 @@ def process_video_to_hls(input_path: Path, output_dir: Path, base_payload: np.nd
         # Step 2: Watermark each segment with multiple versions
         logger.info("Step 2: Watermarking segments")
         successful_segments = {}  # Track which segments were successfully marked
+        segment_copies_info = {"segments": {}}  # For segment_copies.json
         
         for i, segment in enumerate(segments):
+            segment_copies_info["segments"][str(i)] = []  # Initialize list for this segment
             try:
                 # Create num_copies watermarked versions of each segment
                 for copy_index in range(num_copies):
@@ -108,9 +114,9 @@ def process_video_to_hls(input_path: Path, output_dir: Path, base_payload: np.nd
                     cmd = [
                         'ffmpeg',
                         '-i', str(temp_output),
-                        '-c:v', 'copy',  # Copy video codec
-                        '-c:a', 'copy',  # Copy audio codec
-                        '-movflags', '+frag_keyframe+empty_moov+default_base_moof',  # Fragmented MP4 flags
+                        '-c:v', 'copy',
+                        '-c:a', 'copy',
+                        '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
                         '-f', 'mp4',
                         str(output_file)
                     ]
@@ -124,6 +130,13 @@ def process_video_to_hls(input_path: Path, output_dir: Path, base_payload: np.nd
                         "payload": segment_payload.tolist(),
                         "file_path": str(output_file)
                     }
+                    
+                    # Add to segment_copies_info - use .m4s extension
+                    segment_copies_info["segments"][str(i)].append({
+                        "file": f"marked_seg{i:03d}_copy{copy_index}.m4s",
+                        "payload": segment_payload.tolist(),
+                        "copy_index": copy_index
+                    })
                 
             except Exception as e:
                 logger.warning(f"Failed to watermark segment {i}: {str(e)}")
@@ -140,6 +153,13 @@ def process_video_to_hls(input_path: Path, output_dir: Path, base_payload: np.nd
                 ]
                 subprocess.run(cmd, check=True, capture_output=True)
                 logger.info(f"Created fallback segment {output_file}")
+                
+                # Add fallback to segment_copies_info - use .m4s extension
+                segment_copies_info["segments"][str(i)].append({
+                    "file": f"marked_seg{i:03d}_copy0.m4s",
+                    "payload": generate_payload_for_segment(i, 0).tolist(),
+                    "copy_index": 0
+                })
         
         # Save segment mapping information
         mapping_file = output_dir / "segment_mapping.json"
@@ -149,6 +169,44 @@ def process_video_to_hls(input_path: Path, output_dir: Path, base_payload: np.nd
                 "num_copies": num_copies,
                 "description": "Maps segment numbers to their watermarked versions"
             }, f, indent=2)
+            
+        # Save segment copies information
+        copies_file = output_dir / "segment_copies.json"
+        with open(copies_file, 'w') as f:
+            json.dump(segment_copies_info, f, indent=2)
+        logger.info(f"Created segment copies file at {copies_file}")
+            
+        # Create a base playlist.m3u8 file that will be used as a template
+        playlist_content = "#EXTM3U\n"
+        playlist_content += "#EXT-X-VERSION:7\n"
+        playlist_content += "#EXT-X-TARGETDURATION:2\n"
+        playlist_content += "#EXT-X-MEDIA-SEQUENCE:0\n\n"
+        
+        # Add all segments for copy 0 as the base playlist
+        for i in range(len(segments)):
+            segment_file = f"marked_seg{i:03d}_copy0.m4s"
+            if (hls_dir / segment_file).exists():
+                playlist_content += f"#EXTINF:2.0,\n"
+                playlist_content += f"{segment_file}\n"
+        
+        playlist_content += "#EXT-X-ENDLIST\n"
+        
+        # Save the base playlist
+        playlist_path = hls_dir / "playlist.m3u8"
+        with open(playlist_path, 'w') as f:
+            f.write(playlist_content)
+        logger.info(f"Created base playlist at {playlist_path}")
+            
+        # Create a simple master playlist
+        master_content = "#EXTM3U\n"
+        master_content += "#EXT-X-VERSION:7\n"
+        master_content += "#EXT-X-STREAM-INF:BANDWIDTH=2000000\n"
+        master_content += "playlist.m3u8\n"
+        
+        master_path = hls_dir / "master.m3u8"
+        with open(master_path, 'w') as f:
+            f.write(master_content)
+        logger.info(f"Created master playlist at {master_path}")
         
         return True
     except Exception as e:
@@ -173,11 +231,12 @@ def create_view_playlist(view_number: int, num_copies: int, num_segments: int) -
     
     logger.info(f"View base-{num_copies} representation: {view_base}")
     
-    # Create m3u8 content
+    # Create m3u8 content with fMP4 specific tags
     m3u8_content = "#EXTM3U\n"
     m3u8_content += "#EXT-X-VERSION:7\n"
     m3u8_content += "#EXT-X-TARGETDURATION:2\n"
-    m3u8_content += "#EXT-X-MEDIA-SEQUENCE:0\n\n"
+    m3u8_content += "#EXT-X-MEDIA-SEQUENCE:0\n"
+    m3u8_content += "#EXT-X-MAP:URI=\"/hls/init.mp4\"\n\n"  # Add initialization segment
     
     # Add segments based on view_base
     for i, copy_index in enumerate(view_base):
@@ -231,7 +290,9 @@ async def upload_video(file: UploadFile):
         if not success:
             raise HTTPException(status_code=500, detail="Failed to process video")
         
-        return {"status": "success", "message": "Video uploaded and processed successfully"}
+        # Redirect to view page after successful upload
+        return RedirectResponse(url="/view", status_code=303)
+        
     except Exception as e:
         # Clean up uploaded file if processing fails
         if file_path.exists():
@@ -280,23 +341,6 @@ async def start_view(view_data: dict):
         with open(playlist_file, 'w') as f:
             f.write(playlist_content)
         
-        # Update view history
-        view_id = str(uuid.uuid4())
-        view_history[view_id] = {
-            "username": username,
-            "timestamp": datetime.now().isoformat(),
-            "view_number": view_number,
-            "num_copies": num_copies,
-            "num_segments": num_segments,
-            "segment_patterns": segment_mapping["successful_segments"]
-        }
-        
-        # Save updated view history
-        with open(PROCESSED_DIR / "view_history.json", 'w') as f:
-            json.dump(view_history, f, indent=2)
-        
-        logger.info(f"Successfully created view {view_number} for user {username}")
-        
         # Convert view number to base-num_copies to determine which copy of each segment to use
         view_base = []
         temp_view = view_number
@@ -315,6 +359,28 @@ async def start_view(view_data: dict):
             segment_key = f"marked_seg{i:03d}_copy{copy_index}.m4s"
             if segment_key in segment_mapping["successful_segments"]:
                 segment_patterns[segment_key] = segment_mapping["successful_segments"][segment_key]
+        
+        # Update view history
+        view_id = str(uuid.uuid4())
+        view_history[view_id] = {
+            "username": username,
+            "timestamp": datetime.now().isoformat(),
+            "view_number": view_number,
+            "num_copies": num_copies,
+            "num_segments": num_segments,
+            "segment_patterns": segment_patterns,
+            "segment_mapping": {
+                "successful_segments": segment_patterns,
+                "num_copies": num_copies,
+                "description": "Maps segment numbers to their watermarked versions"
+            }
+        }
+        
+        # Save updated view history
+        with open(PROCESSED_DIR / "view_history.json", 'w') as f:
+            json.dump(view_history, f, indent=2)
+        
+        logger.info(f"Successfully created view {view_number} for user {username}")
         
         return {
             "status": "success",
@@ -630,12 +696,37 @@ async def get_video(view_id: str):
             
         view_info = view_history[view_id]
         
-        # Create a new playlist for this view
-        playlist_content = create_view_playlist(
-            view_info["view_number"],
-            view_info["num_copies"],
-            view_info["num_segments"]
-        )
+        # Convert view number to pattern string
+        view_base = []
+        temp_view = view_info["view_number"]
+        num_copies = view_info["num_copies"]
+        while temp_view > 0:
+            view_base.append(temp_view % num_copies)
+            temp_view //= num_copies
+        # Pad with zeros if needed
+        while len(view_base) < view_info["num_segments"]:
+            view_base.append(0)
+        # Reverse to get correct order
+        view_base.reverse()
+        
+        # Create HLS playlist content
+        playlist_content = "#EXTM3U\n"
+        playlist_content += "#EXT-X-VERSION:7\n"
+        playlist_content += "#EXT-X-TARGETDURATION:2\n"
+        playlist_content += "#EXT-X-MEDIA-SEQUENCE:0\n\n"
+        
+        # Add segments based on view_base
+        for i, copy_index in enumerate(view_base):
+            segment_file = f"marked_seg{i:03d}_copy{copy_index}.m4s"
+            # Check if the segment file exists
+            if (PROCESSED_DIR / "hls" / segment_file).exists():
+                playlist_content += f"#EXTINF:2.0,\n"
+                playlist_content += f"/hls/{segment_file}\n"
+                logger.info(f"Added segment {segment_file} to playlist")
+            else:
+                logger.warning(f"Segment file {segment_file} not found")
+        
+        playlist_content += "#EXT-X-ENDLIST\n"
         
         logger.info("Created playlist content")
         logger.debug(f"Playlist content:\n{playlist_content}")
@@ -681,6 +772,128 @@ async def get_hls_segment(filename: str):
     except Exception as e:
         logger.error(f"Error serving segment: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/download-view/{view_id}")
+async def download_view(view_id: str):
+    try:
+        logger.info(f"Starting download for view ID: {view_id}")
+        
+        # Load view history
+        with open(PROCESSED_DIR / "view_history.json", 'r') as f:
+            view_history = json.load(f)
+        
+        if view_id not in view_history:
+            logger.error(f"View ID {view_id} not found in history")
+            raise HTTPException(status_code=404, detail="View not found")
+        
+        view_info = view_history[view_id]
+        view_number = view_info['view_number']
+        num_copies = view_info['num_copies']
+        num_segments = view_info['num_segments']
+        
+        logger.info(f"View info: number={view_number}, copies={num_copies}, segments={num_segments}")
+        
+        # Create view_base array
+        view_base = []
+        temp_view = view_number
+        while temp_view > 0:
+            view_base.append(temp_view % num_copies)
+            temp_view //= num_copies
+        # Pad with zeros if needed
+        while len(view_base) < num_segments:
+            view_base.append(0)
+        # Reverse to get correct order
+        view_base.reverse()
+        
+        logger.info(f"Generated view_base array: {view_base}")
+        
+        # Create temp directory if it doesn't exist
+        temp_dir = PROCESSED_DIR / "temp_download"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created temp directory: {temp_dir}")
+        
+        # Create output file path
+        output_file = temp_dir / f"view_{view_id}.mp4"
+        logger.info(f"Output file path: {output_file}")
+        
+        # Log HLS directory contents
+        hls_dir = PROCESSED_DIR / "hls"
+        logger.info(f"HLS directory contents: {list(hls_dir.glob('*.m4s'))}")
+        
+        # Create list of segment files based on view_base
+        segment_files = []
+        for i, copy_index in enumerate(view_base):
+            segment_file = f"marked_seg{i:03d}_copy{copy_index}.m4s"
+            segment_path = hls_dir / segment_file
+            if segment_path.exists():
+                segment_files.append(str(segment_path))
+                logger.info(f"Added segment file: {segment_path}")
+            else:
+                logger.warning(f"Segment file not found: {segment_path}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Segment file not found: {segment_file}"
+                )
+        
+        if not segment_files:
+            raise HTTPException(
+                status_code=404,
+                detail="No segment files found"
+            )
+        
+        logger.info(f"Concatenating {len(segment_files)} segments into {output_file}")
+        
+        # Use concatenate_segments to create the MP4
+        try:
+            concatenate_segments(segment_files, str(output_file))
+            logger.info(f"Successfully created MP4 file at {output_file}")
+        except Exception as e:
+            logger.error(f"Error concatenating segments: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to concatenate segments: {str(e)}"
+            )
+        
+        if not output_file.exists():
+            logger.error(f"Output file was not created at {output_file}")
+            raise HTTPException(
+                status_code=500,
+                detail="Output file was not created"
+            )
+        
+        # Get file size
+        file_size = output_file.stat().st_size
+        logger.info(f"Output file size: {file_size} bytes")
+        
+        # Create response with cleanup
+        async def cleanup():
+            try:
+                if output_file.exists():
+                    output_file.unlink()
+                    logger.info("Cleaned up output file")
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
+        
+        logger.info("Returning StreamingResponse")
+        return StreamingResponse(
+            open(output_file, 'rb'),
+            media_type='video/mp4',
+            headers={
+                'Content-Disposition': f'attachment; filename="watermarked_video_{view_id}.mp4"',
+                'Content-Length': str(file_size)
+            },
+            background=cleanup
+        )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading video: {e}")
+        logger.exception("Full traceback:")  # This will log the full stack trace
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error downloading video: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn

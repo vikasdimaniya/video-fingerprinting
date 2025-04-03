@@ -105,6 +105,7 @@ button:hover {
             <input type="text" id="username" placeholder="Enter your username" required>
         </div>
         <button onclick="startView()">Start View</button>
+        <button id="downloadBtn" onclick="downloadVideo()" style="display: none; background-color: #28a745;">Download Video</button>
     </div>
 </div>
 {% endblock %}
@@ -251,6 +252,20 @@ button:hover {
         }
     }
 
+    async function downloadVideo() {
+        if (!currentViewId) {
+            showError('Please start a view before downloading');
+            return;
+        }
+        
+        try {
+            window.location.href = `/download-view/${currentViewId}`;
+        } catch (error) {
+            console.error('Error downloading video:', error);
+            showError('Error downloading video: ' + error.message);
+        }
+    }
+
     async function startView() {
         const usernameInput = document.getElementById('username');
         
@@ -290,6 +305,12 @@ button:hover {
                 }
                 if (errorDiv) {
                     errorDiv.style.display = 'none';
+                }
+                
+                // Show download button
+                const downloadBtn = document.getElementById('downloadBtn');
+                if (downloadBtn) {
+                    downloadBtn.style.display = 'inline-block';
                 }
                 
                 // Initialize video player with the new view
