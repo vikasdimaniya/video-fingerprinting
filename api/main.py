@@ -586,6 +586,41 @@ async def detect_leak(file: UploadFile):
         pattern, frequency, success = detect_patterns_in_segment(str(leaked_file))
         
         if not success or pattern is None:
+            # Try to determine if this is a segment that failed to embed
+            segment_number = None
+            for view_id, view_data in view_history.items():
+                segment_mapping = view_data.get("segment_mapping", {})
+                successful_segments = segment_mapping.get("successful_segments", {})
+                if not successful_segments:
+                    continue
+                
+                # Get the number of segments from the view data
+                num_segments = view_data.get("num_segments", 0)
+                
+                # Check each segment number
+                for i in range(num_segments):
+                    # Check all possible copies for this segment
+                    segment_found = False
+                    for copy_index in range(view_data.get("num_copies", 3)):
+                        segment_key = f"marked_seg{i:03d}_copy{copy_index}.m4s"
+                        if segment_key in successful_segments:
+                            segment_found = True
+                            break
+                    
+                    if not segment_found:
+                        segment_number = i
+                        logger.info(f"Found failed segment: {segment_number} (not found in any copy)")
+                        break
+                if segment_number is not None:
+                    break
+            
+            if segment_number is not None:
+                return {
+                    "status": "no_match",
+                    "error": f"Segment {segment_number} was not successfully marked in any view",
+                    "segment_number": segment_number,
+                    "note": "This segment failed to embed during watermarking"
+                }
             return {"error": "Could not detect watermark pattern"}
         
         # Decode the detected pattern
@@ -650,7 +685,8 @@ async def detect_leak(file: UploadFile):
                 return {
                     "status": "no_match",
                     "error": f"Segment {segment_number} was not successfully marked in any view",
-                    "segment_number": segment_number
+                    "segment_number": segment_number,
+                    "note": "This segment failed to embed during watermarking"
                 }
             else:
                 return {
